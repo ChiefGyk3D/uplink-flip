@@ -1,0 +1,815 @@
+#!/usr/bin/env bash
+# uplink-flip: make a cellular (gsm) NetworkManager connection carry the default
+# route, and flip back. See README.md. Needs only bash and nmcli.
+set -euo pipefail
+
+VERSION="0.1.0"
+
+# Exit codes.
+readonly EX_OK=0
+readonly EX_FAIL=1       # runtime error; changes were rolled back
+readonly EX_USAGE=2      # bad arguments or configuration
+readonly EX_REFUSED=3    # precondition not met; nothing was changed
+readonly EX_ROLLBACK=4   # rollback failed; manual recovery commands were printed
+readonly EX_NOCONNECT=5  # status: connectivity check failed
+
+DRY_RUN=0
+MODE=""
+CONFIG_FILE=""
+STATE_DIR=""
+STATE_FILE=""
+
+# Settings (environment beats config file beats built-in default).
+CFG_ETHERNET=""
+CFG_WIFI=""
+CFG_GSM=""
+CFG_CHECK_URL="http://nmcheck.gnome.org/check_network_status.txt"
+CFG_CHECK_TIMEOUT="5"
+CFG_DEMOTE_METRIC="2000"
+
+# Active connections found by scan_active (parallel arrays).
+ACT_UUID=()
+ACT_TYPE=()
+ACT_DEV=()
+ACT_NAME=()
+
+# Connections touched by an apply in progress (parallel arrays), for rollback.
+TOUCH_UUID=()
+TOUCH_V4ND=()
+TOUCH_V4M=()
+TOUCH_V6ND=()
+TOUCH_V6M=()
+TOUCH_DEV=()
+NEW_UUID=()
+IN_APPLY=0
+IN_CLEANUP=0
+LOCK_HELD=0
+
+usage() {
+    cat <<'EOF'
+Usage: uplink-flip [--dry-run] <cell|normal|status>
+       uplink-flip --help | --version
+
+Modes:
+  cell     Make the active gsm (cellular) connection carry the default route.
+           Active ethernet and wifi connections keep their local subnets but
+           stop carrying the default route. Previous values are saved.
+  normal   Restore exactly the values saved by "cell", then remove the state.
+  status   Show default routes, which connection carries them, each
+           connection's settings, and run one bounded connectivity check.
+
+Options:
+  --dry-run   Print the nmcli commands that would change anything and change
+              nothing. Read-only nmcli, ip and curl calls still run.
+  -h, --help  Show this help.
+  --version   Show the version.
+
+Environment (all optional; a config file may set the same keys without the
+UPLINK_FLIP_ prefix, one KEY=VALUE per line):
+  UPLINK_FLIP_ETHERNET       connection name or UUID to treat as the ethernet one
+  UPLINK_FLIP_WIFI           connection name or UUID to treat as the wifi one
+  UPLINK_FLIP_GSM            connection name or UUID to treat as the cellular one
+  UPLINK_FLIP_CHECK_URL      connectivity check target (empty disables the check)
+  UPLINK_FLIP_CHECK_TIMEOUT  seconds for the whole check request (default 5)
+  UPLINK_FLIP_DEMOTE_METRIC  route metric given to demoted connections (default 2000)
+  UPLINK_FLIP_CONFIG         config file (default $XDG_CONFIG_HOME/uplink-flip/config)
+  XDG_STATE_HOME             state lives in $XDG_STATE_HOME/uplink-flip/state
+
+Exit codes:
+  0  success (including "nothing to do")
+  1  runtime error; any partial change was rolled back
+  2  usage or configuration error
+  3  refused: a precondition is not met (for example no active gsm
+     connection with its own gateway); nothing was changed
+  4  rollback or restore failed; manual recovery commands were printed
+  5  status only: the connectivity check failed
+EOF
+}
+
+log() { printf '%s\n' "$*"; }
+warn() { printf 'uplink-flip: warning: %s\n' "$*" >&2; }
+err() { printf 'uplink-flip: error: %s\n' "$*" >&2; }
+
+die() {
+    local code="$1"
+    shift
+    err "$*"
+    exit "$code"
+}
+
+# ---------------------------------------------------------------- validation
+
+valid_uuid() { [[ "$1" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; }
+valid_bool() { [[ "$1" == "yes" || "$1" == "no" ]]; }
+valid_metric() { [[ "$1" =~ ^(-1|[0-9]{1,10})$ ]] && ((10#${1#-} <= 4294967295)); }
+valid_dev() { [[ "$1" =~ ^[A-Za-z0-9_.:@-]{1,32}$ ]]; }
+# A name is acceptable when it is non-empty and holds no control character
+# (this also rules out terminal escape sequences in anything we print).
+valid_name() { [[ -n "$1" && ! "$1" =~ [[:cntrl:]] ]]; }
+
+# ------------------------------------------------------------------- config
+
+parse_config_file() {
+    local file="$1" line key val lineno=0
+    [[ -f "$file" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        lineno=$((lineno + 1))
+        [[ "$line" =~ ^[[:space:]]*(#.*)?$ ]] && continue
+        if [[ ! "$line" =~ ^[[:space:]]*([A-Z_]+)=(.*)$ ]]; then
+            die "$EX_USAGE" "$file:$lineno: expected KEY=VALUE"
+        fi
+        key="${BASH_REMATCH[1]}"
+        val="${BASH_REMATCH[2]}"
+        # Strip one pair of surrounding quotes. Nothing is ever expanded.
+        if [[ "$val" =~ ^\"(.*)\"$ || "$val" =~ ^\'(.*)\'$ ]]; then
+            val="${BASH_REMATCH[1]}"
+        fi
+        case "$key" in
+        ETHERNET) CFG_ETHERNET="$val" ;;
+        WIFI) CFG_WIFI="$val" ;;
+        GSM) CFG_GSM="$val" ;;
+        CHECK_URL) CFG_CHECK_URL="$val" ;;
+        CHECK_TIMEOUT) CFG_CHECK_TIMEOUT="$val" ;;
+        DEMOTE_METRIC) CFG_DEMOTE_METRIC="$val" ;;
+        *) die "$EX_USAGE" "$file:$lineno: unknown key '$key'" ;;
+        esac
+    done <"$file"
+}
+
+load_config() {
+    local cfg_home="${XDG_CONFIG_HOME:-}"
+    if [[ -z "$cfg_home" ]]; then
+        [[ -n "${HOME:-}" ]] || die "$EX_USAGE" "HOME is not set"
+        cfg_home="$HOME/.config"
+    fi
+    CONFIG_FILE="${UPLINK_FLIP_CONFIG:-$cfg_home/uplink-flip/config}"
+    parse_config_file "$CONFIG_FILE"
+
+    # Environment wins over the file. ${VAR+x} keeps an explicit empty value.
+    [[ -n "${UPLINK_FLIP_ETHERNET+x}" ]] && CFG_ETHERNET="$UPLINK_FLIP_ETHERNET"
+    [[ -n "${UPLINK_FLIP_WIFI+x}" ]] && CFG_WIFI="$UPLINK_FLIP_WIFI"
+    [[ -n "${UPLINK_FLIP_GSM+x}" ]] && CFG_GSM="$UPLINK_FLIP_GSM"
+    [[ -n "${UPLINK_FLIP_CHECK_URL+x}" ]] && CFG_CHECK_URL="$UPLINK_FLIP_CHECK_URL"
+    [[ -n "${UPLINK_FLIP_CHECK_TIMEOUT+x}" ]] && CFG_CHECK_TIMEOUT="$UPLINK_FLIP_CHECK_TIMEOUT"
+    [[ -n "${UPLINK_FLIP_DEMOTE_METRIC+x}" ]] && CFG_DEMOTE_METRIC="$UPLINK_FLIP_DEMOTE_METRIC"
+
+    [[ "$CFG_CHECK_TIMEOUT" =~ ^[1-9][0-9]{0,2}$ ]] ||
+        die "$EX_USAGE" "CHECK_TIMEOUT must be a whole number of seconds (1-999)"
+    [[ "$CFG_DEMOTE_METRIC" =~ ^[0-9]{1,10}$ ]] && ((10#$CFG_DEMOTE_METRIC >= 1 && 10#$CFG_DEMOTE_METRIC <= 4294967294)) ||
+        die "$EX_USAGE" "DEMOTE_METRIC must be a number from 1 to 4294967294"
+    CFG_DEMOTE_METRIC=$((10#$CFG_DEMOTE_METRIC))
+    if [[ -n "$CFG_CHECK_URL" && ! "$CFG_CHECK_URL" =~ ^https?://[^[:space:]]+$ ]]; then
+        die "$EX_USAGE" "CHECK_URL must be an http:// or https:// URL"
+    fi
+    if [[ -n "$CFG_CHECK_URL" && "$CFG_CHECK_URL" == *[[:cntrl:]]* ]]; then
+        die "$EX_USAGE" "CHECK_URL holds a control character"
+    fi
+
+    local state_home="${XDG_STATE_HOME:-}"
+    if [[ -z "$state_home" ]]; then
+        [[ -n "${HOME:-}" ]] || die "$EX_USAGE" "HOME is not set"
+        state_home="$HOME/.local/state"
+    fi
+    STATE_DIR="$state_home/uplink-flip"
+    STATE_FILE="$STATE_DIR/state"
+}
+
+# ------------------------------------------------------------ nmcli wrappers
+
+# Every call that changes anything goes through nm_change, so --dry-run is
+# enforced in one place.
+nm_change() {
+    if ((DRY_RUN)); then
+        printf '+ nmcli'
+        printf ' %q' "$@"
+        printf '\n'
+        return 0
+    fi
+    nmcli "$@"
+}
+
+# Fill ACT_* from the active connections. nmcli runs with --escape no so a
+# name holding ':' stays intact; NAME is last so read keeps the rest of the
+# line. Every field is validated; a bad entry is skipped with a warning.
+scan_active() {
+    local out line uuid type dev name
+    ACT_UUID=() ACT_TYPE=() ACT_DEV=() ACT_NAME=()
+    out="$(nmcli -t --escape no -f UUID,TYPE,DEVICE,NAME connection show --active)" ||
+        die "$EX_FAIL" "nmcli could not list active connections"
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        IFS=: read -r uuid type dev name <<<"$line"
+        if ! valid_uuid "$uuid" || ! valid_name "$name"; then
+            warn "skipping a connection with an unusable UUID or name"
+            continue
+        fi
+        [[ "$dev" == "--" ]] && dev=""
+        if [[ -n "$dev" ]] && ! valid_dev "$dev"; then
+            warn "skipping connection '$name': unusable device name"
+            continue
+        fi
+        case "$type" in
+        802-3-ethernet | ethernet) type="ethernet" ;;
+        802-11-wireless | wifi) type="wifi" ;;
+        gsm) type="gsm" ;;
+        *) type="other" ;;
+        esac
+        ACT_UUID+=("$uuid")
+        ACT_TYPE+=("$type")
+        ACT_DEV+=("$dev")
+        ACT_NAME+=("$name")
+    done <<<"$out"
+}
+
+# Read the four route settings of one connection into V4ND V4M V6ND V6M.
+V4ND="" V4M="" V6ND="" V6M=""
+read_settings() {
+    local uuid="$1" out
+    local -a vals
+    out="$(nmcli -g ipv4.never-default,ipv4.route-metric,ipv6.never-default,ipv6.route-metric connection show uuid "$uuid")" ||
+        return 1
+    mapfile -t vals <<<"$out"
+    ((${#vals[@]} == 4)) || return 1
+    V4ND="${vals[0]}" V4M="${vals[1]}" V6ND="${vals[2]}" V6M="${vals[3]}"
+    valid_bool "$V4ND" && valid_bool "$V6ND" && valid_metric "$V4M" && valid_metric "$V6M"
+}
+
+# Set the four values on a connection, then ask the kernel-side device to pick
+# them up with "device reapply" (no reconnect). A connection that is not
+# active has no device, so only the profile changes. Returns 1 when the profile
+# change failed and 2 when only the reapply failed.
+set_settings() {
+    local uuid="$1" v4nd="$2" v4m="$3" v6nd="$4" v6m="$5" dev="$6"
+    nm_change connection modify uuid "$uuid" \
+        ipv4.never-default "$v4nd" ipv6.never-default "$v6nd" \
+        ipv4.route-metric "$v4m" ipv6.route-metric "$v6m" || return 1
+    if [[ -n "$dev" ]]; then
+        nm_change device reapply "$dev" || return 2
+    fi
+}
+
+# ------------------------------------------------------------------- routes
+
+# Print "family dev gateway metric" for each default route.
+default_routes() {
+    local fam out line
+    local -a t
+    local i via dev metric
+    for fam in 4 6; do
+        out="$(ip -"$fam" route show default 2>/dev/null)" || out=""
+        while IFS= read -r line; do
+            [[ "$line" == default* ]] || continue
+            read -r -a t <<<"$line"
+            via="" dev="" metric=0
+            for ((i = 0; i < ${#t[@]} - 1; i++)); do
+                case "${t[i]}" in
+                via) via="${t[i + 1]}" ;;
+                dev) dev="${t[i + 1]}" ;;
+                metric) metric="${t[i + 1]}" ;;
+                esac
+            done
+            [[ "$metric" =~ ^[0-9]+$ ]] || metric=0
+            printf '%s %s %s %s\n' "$fam" "${dev:--}" "${via:--}" "$metric"
+        done <<<"$out"
+    done
+}
+
+# Device carrying the lowest-metric default route of a family (empty if none).
+winner_dev() {
+    local want="$1" fam dev via metric best="" bestm=""
+    while read -r fam dev via metric; do
+        [[ "$fam" == "$want" ]] || continue
+        if [[ -z "$bestm" ]] || ((metric < bestm)); then
+            best="$dev" bestm="$metric"
+        fi
+    done < <(default_routes)
+    [[ "$best" == "-" ]] && best=""
+    printf '%s' "$best"
+}
+
+any_default_route() {
+    local n
+    n="$(default_routes | wc -l)"
+    ((n > 0))
+}
+
+# True when the device has a default route with a gateway.
+dev_has_gateway_default() {
+    local want="$1" fam dev via metric
+    while read -r fam dev via metric; do
+        if [[ "$dev" == "$want" && "$via" != "-" ]]; then
+            return 0
+        fi
+    done < <(default_routes)
+    return 1
+}
+
+dev_to_name() {
+    local want="$1" i
+    for i in "${!ACT_DEV[@]}"; do
+        if [[ "${ACT_DEV[i]}" == "$want" ]]; then
+            printf '%s' "${ACT_NAME[i]}"
+            return 0
+        fi
+    done
+    printf '(unknown connection)'
+}
+
+# ------------------------------------------------------------- state storage
+
+# state line: conn <uuid> <v4nd> <v4metric> <v6nd> <v6metric> <dev>
+# Held in STATE_UUID etc. as parallel arrays while we work with it.
+ST_UUID=()
+ST_V4ND=()
+ST_V4M=()
+ST_V6ND=()
+ST_V6M=()
+ST_DEV=()
+
+load_state() {
+    local line tag uuid v4nd v4m v6nd v6m dev header=0 extra
+    ST_UUID=() ST_V4ND=() ST_V4M=() ST_V6ND=() ST_V6M=() ST_DEV=()
+    [[ -f "$STATE_FILE" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "# uplink-flip state v1" ]]; then
+            header=1
+            continue
+        fi
+        [[ "$line" =~ ^[[:space:]]*(#.*)?$ ]] && continue
+        read -r tag uuid v4nd v4m v6nd v6m dev extra <<<"$line"
+        if [[ "$tag" != "conn" || -n "$extra" ]] || ! valid_uuid "$uuid" ||
+            ! valid_bool "$v4nd" || ! valid_bool "$v6nd" ||
+            ! valid_metric "$v4m" || ! valid_metric "$v6m"; then
+            die "$EX_FAIL" "state file $STATE_FILE is corrupt; refusing to act on it (inspect or remove it by hand)"
+        fi
+        [[ "$dev" == "-" ]] && dev=""
+        ST_UUID+=("$uuid") ST_V4ND+=("$v4nd") ST_V4M+=("$v4m")
+        ST_V6ND+=("$v6nd") ST_V6M+=("$v6m") ST_DEV+=("$dev")
+    done <"$STATE_FILE"
+    ((header)) || die "$EX_FAIL" "state file $STATE_FILE has no header; refusing to act on it"
+}
+
+state_index() {
+    local want="$1" i
+    for i in "${!ST_UUID[@]}"; do
+        if [[ "${ST_UUID[i]}" == "$want" ]]; then
+            printf '%s' "$i"
+            return 0
+        fi
+    done
+    return 1
+}
+
+ensure_state_dir() {
+    local old_umask
+    old_umask="$(umask)"
+    umask 077
+    mkdir -p "$STATE_DIR"
+    umask "$old_umask"
+    chmod 700 "$STATE_DIR"
+}
+
+# Write the ST_* arrays atomically: temp file in the same directory (mode
+# 600), then rename. An empty set removes the state file.
+save_state() {
+    local tmp i
+    if ((${#ST_UUID[@]} == 0)); then
+        rm -f "$STATE_FILE"
+        return 0
+    fi
+    ensure_state_dir
+    tmp="$(umask 077 && mktemp "$STATE_DIR/state.XXXXXX")"
+    {
+        printf '# uplink-flip state v1\n'
+        for i in "${!ST_UUID[@]}"; do
+            printf 'conn %s %s %s %s %s %s\n' "${ST_UUID[i]}" "${ST_V4ND[i]}" "${ST_V4M[i]}" \
+                "${ST_V6ND[i]}" "${ST_V6M[i]}" "${ST_DEV[i]:--}"
+        done
+    } >"$tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$STATE_FILE"
+}
+
+acquire_lock() {
+    ((DRY_RUN)) && return 0
+    ensure_state_dir
+    exec 9>"$STATE_DIR/lock"
+    flock -n 9 || die "$EX_REFUSED" "another uplink-flip is running"
+    LOCK_HELD=1
+}
+
+# -------------------------------------------------------------- recovery
+
+# Print manual commands that put one connection back to the given values.
+print_recovery() {
+    local uuid="$1" v4nd="$2" v4m="$3" v6nd="$4" v6m="$5"
+    printf '  nmcli connection modify uuid %q ipv4.never-default %q ipv6.never-default %q ipv4.route-metric %q ipv6.route-metric %q\n' \
+        "$uuid" "$v4nd" "$v6nd" "$v4m" "$v6m" >&2
+}
+
+# Put every touched connection back. Returns non-zero if any step failed.
+rollback_all() {
+    local i rc=0 uuid
+    local -a failed=()
+    for i in "${!TOUCH_UUID[@]}"; do
+        uuid="${TOUCH_UUID[i]}"
+        if ! set_settings "$uuid" "${TOUCH_V4ND[i]}" "${TOUCH_V4M[i]}" "${TOUCH_V6ND[i]}" "${TOUCH_V6M[i]}" "${TOUCH_DEV[i]}"; then
+            failed+=("$i")
+            rc=1
+        fi
+    done
+    if ((rc)); then
+        err "rollback failed for ${#failed[@]} connection(s). Run these by hand, then 'nmcli device reapply <device>':"
+        for i in "${failed[@]}"; do
+            print_recovery "${TOUCH_UUID[i]}" "${TOUCH_V4ND[i]}" "${TOUCH_V4M[i]}" "${TOUCH_V6ND[i]}" "${TOUCH_V6M[i]}"
+        done
+        err "The state file $STATE_FILE was kept."
+    fi
+    return "$rc"
+}
+
+# EXIT trap. An exit while an apply is in flight (error, set -e, INT, TERM)
+# rolls back before leaving.
+on_exit() {
+    local code=$?
+    trap - EXIT
+    ((IN_CLEANUP)) && exit "$code"
+    IN_CLEANUP=1
+    if ((IN_APPLY)); then
+        IN_APPLY=0
+        err "interrupted or failed mid-change; rolling back"
+        if rollback_all; then
+            # Originals are back, so the saved state no longer describes a change.
+            drop_touched_from_state
+            ((code == 0)) && code="$EX_FAIL"
+        else
+            code="$EX_ROLLBACK"
+        fi
+    fi
+    exit "$code"
+}
+
+# Remove the entries this run added (their originals were never changed, or
+# were just restored). Entries saved by an earlier run stay: they still hold
+# the true originals.
+drop_touched_from_state() {
+    local keep_uuid=() keep_v4nd=() keep_v4m=() keep_v6nd=() keep_v6m=() keep_dev=()
+    local i j skip
+    for i in "${!ST_UUID[@]}"; do
+        skip=0
+        for j in "${!NEW_UUID[@]}"; do
+            [[ "${ST_UUID[i]}" == "${NEW_UUID[j]}" ]] && skip=1
+        done
+        ((skip)) && continue
+        keep_uuid+=("${ST_UUID[i]}") keep_v4nd+=("${ST_V4ND[i]}") keep_v4m+=("${ST_V4M[i]}")
+        keep_v6nd+=("${ST_V6ND[i]}") keep_v6m+=("${ST_V6M[i]}") keep_dev+=("${ST_DEV[i]}")
+    done
+    ST_UUID=("${keep_uuid[@]+"${keep_uuid[@]}"}")
+    ST_V4ND=("${keep_v4nd[@]+"${keep_v4nd[@]}"}")
+    ST_V4M=("${keep_v4m[@]+"${keep_v4m[@]}"}")
+    ST_V6ND=("${keep_v6nd[@]+"${keep_v6nd[@]}"}")
+    ST_V6M=("${keep_v6m[@]+"${keep_v6m[@]}"}")
+    ST_DEV=("${keep_dev[@]+"${keep_dev[@]}"}")
+    ((DRY_RUN)) || save_state
+}
+
+# ------------------------------------------------------------ mode: cell
+
+# Find the gsm connection: the override, else the one active gsm connection.
+pick_gsm() {
+    local i found=-1 n=0
+    for i in "${!ACT_UUID[@]}"; do
+        [[ "${ACT_TYPE[i]}" == "gsm" ]] || continue
+        if [[ -n "$CFG_GSM" && "${ACT_NAME[i]}" != "$CFG_GSM" && "${ACT_UUID[i]}" != "$CFG_GSM" ]]; then
+            continue
+        fi
+        found="$i"
+        n=$((n + 1))
+    done
+    if [[ -n "$CFG_GSM" && "$n" -eq 0 ]]; then
+        # The override may name a connection of another type; honor it only if active.
+        for i in "${!ACT_UUID[@]}"; do
+            if [[ "${ACT_NAME[i]}" == "$CFG_GSM" || "${ACT_UUID[i]}" == "$CFG_GSM" ]]; then
+                found="$i"
+                n=$((n + 1))
+            fi
+        done
+    fi
+    ((n == 0)) && die "$EX_REFUSED" "no active gsm connection found; bring the cellular connection up first (or set UPLINK_FLIP_GSM)"
+    ((n > 1)) && die "$EX_REFUSED" "more than one active gsm connection; set UPLINK_FLIP_GSM to the one to use"
+    GSM_IDX="$found"
+}
+
+# Fatal route checks after a change: some default route must exist and the
+# gsm device must still have its own.
+check_cell_routes() {
+    any_default_route || die "$EX_FAIL" "no default route left after the change"
+    dev_has_gateway_default "$1" || die "$EX_FAIL" "'$2' lost its default route after the change"
+}
+
+# Print the first device (other than the gsm one) that wins a default route
+# in either family; empty when gsm wins everywhere it can.
+non_gsm_winner() {
+    local fam w
+    for fam in 4 6; do
+        w="$(winner_dev "$fam")"
+        if [[ -n "$w" && "$w" != "$1" ]]; then
+            printf '%s' "$w"
+            return 0
+        fi
+    done
+}
+
+mode_cell() {
+    local i j rc gdev gname tgt_uuid tgt_name matches
+    local -a targets=()
+    GSM_IDX=-1
+    scan_active
+    pick_gsm
+    gdev="${ACT_DEV[GSM_IDX]}"
+    gname="${ACT_NAME[GSM_IDX]}"
+    [[ -n "$gdev" ]] || die "$EX_REFUSED" "gsm connection '$gname' has no device"
+    dev_has_gateway_default "$gdev" ||
+        die "$EX_REFUSED" "gsm connection '$gname' (device $gdev) has no default route with its own gateway; nothing changed"
+
+    # Targets: active ethernet and wifi connections (or the overrides).
+    for i in "${!ACT_UUID[@]}"; do
+        [[ "$i" == "$GSM_IDX" ]] && continue
+        matches=0
+        case "${ACT_TYPE[i]}" in
+        ethernet)
+            if [[ -z "$CFG_ETHERNET" || "${ACT_NAME[i]}" == "$CFG_ETHERNET" || "${ACT_UUID[i]}" == "$CFG_ETHERNET" ]]; then
+                matches=1
+            fi
+            ;;
+        wifi)
+            if [[ -z "$CFG_WIFI" || "${ACT_NAME[i]}" == "$CFG_WIFI" || "${ACT_UUID[i]}" == "$CFG_WIFI" ]]; then
+                matches=1
+            fi
+            ;;
+        esac
+        ((matches)) && targets+=("$i")
+    done
+    # An override may also name a connection of another type; honor it if active.
+    for j in "$CFG_ETHERNET" "$CFG_WIFI"; do
+        [[ -n "$j" ]] || continue
+        for i in "${!ACT_UUID[@]}"; do
+            [[ "$i" == "$GSM_IDX" ]] && continue
+            if [[ "${ACT_NAME[i]}" == "$j" || "${ACT_UUID[i]}" == "$j" ]]; then
+                [[ " ${targets[*]-} " == *" $i "* ]] || targets+=("$i")
+            fi
+        done
+    done
+
+    acquire_lock
+    load_state
+
+    # Plan: record originals for new connections, decide what must change.
+    local -a todo=()
+    local need_state=0
+    for i in "${targets[@]+"${targets[@]}"}"; do
+        tgt_uuid="${ACT_UUID[i]}" tgt_name="${ACT_NAME[i]}"
+        if ! read_settings "$tgt_uuid"; then
+            die "$EX_FAIL" "could not read settings of '$tgt_name'; nothing changed"
+        fi
+        if j="$(state_index "$tgt_uuid")"; then
+            # Already recorded: keep the saved originals. Reapply only if the
+            # live values no longer match the cell values.
+            :
+        else
+            ST_UUID+=("$tgt_uuid") ST_V4ND+=("$V4ND") ST_V4M+=("$V4M")
+            ST_V6ND+=("$V6ND") ST_V6M+=("$V6M") ST_DEV+=("${ACT_DEV[i]}")
+            NEW_UUID+=("$tgt_uuid")
+            need_state=1
+        fi
+        if [[ "$V4ND" == "yes" && "$V6ND" == "yes" && "$V4M" == "$CFG_DEMOTE_METRIC" && "$V6M" == "$CFG_DEMOTE_METRIC" ]]; then
+            continue
+        fi
+        todo+=("$i")
+    done
+
+    if ((${#todo[@]} == 0)); then
+        if ((need_state)); then
+            ((DRY_RUN)) || save_state
+        fi
+        log "Nothing to do: ${#targets[@]} other connection(s) already keep off the default route; '$gname' carries it."
+        return 0
+    fi
+
+    # Record rollback values (the live values before our change).
+    TOUCH_UUID=() TOUCH_V4ND=() TOUCH_V4M=() TOUCH_V6ND=() TOUCH_V6M=() TOUCH_DEV=()
+    for i in "${todo[@]}"; do
+        read_settings "${ACT_UUID[i]}" || die "$EX_FAIL" "could not read settings of '${ACT_NAME[i]}'"
+        TOUCH_UUID+=("${ACT_UUID[i]}") TOUCH_V4ND+=("$V4ND") TOUCH_V4M+=("$V4M")
+        TOUCH_V6ND+=("$V6ND") TOUCH_V6M+=("$V6M") TOUCH_DEV+=("${ACT_DEV[i]}")
+    done
+
+    # Persist the originals first so an interrupted run can be undone by
+    # "normal"; from here on an abnormal exit rolls back.
+    if ((!DRY_RUN)); then
+        IN_APPLY=1
+        save_state
+    fi
+    for i in "${todo[@]}"; do
+        log "Demoting '${ACT_NAME[i]}' (${ACT_DEV[i]:-no device}): never-default yes, route-metric $CFG_DEMOTE_METRIC"
+        rc=0
+        set_settings "${ACT_UUID[i]}" yes "$CFG_DEMOTE_METRIC" yes "$CFG_DEMOTE_METRIC" "${ACT_DEV[i]}" || rc=$?
+        if ((rc == 1)); then
+            die "$EX_FAIL" "could not change '${ACT_NAME[i]}'"
+        elif ((rc == 2)); then
+            warn "device reapply failed for '${ACT_NAME[i]}'; reactivating that one connection"
+            nm_change connection up uuid "${ACT_UUID[i]}" ||
+                die "$EX_FAIL" "could not apply the change to '${ACT_NAME[i]}'"
+        fi
+    done
+
+    if ((!DRY_RUN)); then
+        local loser=""
+        check_cell_routes "$gdev" "$gname"
+        loser="$(non_gsm_winner "$gdev")"
+        if [[ -n "$loser" ]]; then
+            # device reapply did not move the default route (it may not apply
+            # route changes on every NetworkManager version). Fall back to the
+            # documented reactivation, for the connection on that device only.
+            warn "default route still goes through $loser after reapply; reactivating that connection"
+            for i in "${todo[@]}"; do
+                [[ "${ACT_DEV[i]}" == "$loser" ]] || continue
+                nm_change connection up uuid "${ACT_UUID[i]}" ||
+                    die "$EX_FAIL" "could not reactivate '${ACT_NAME[i]}'"
+            done
+            check_cell_routes "$gdev" "$gname"
+            loser="$(non_gsm_winner "$gdev")"
+            [[ -z "$loser" ]] || die "$EX_FAIL" "default route still goes through $loser, not $gdev"
+        fi
+    fi
+    IN_APPLY=0
+    log "Cell is primary: '$gname' ($gdev) carries the default route."
+}
+
+# ---------------------------------------------------------- mode: normal
+
+mode_normal() {
+    local i uuid dev n_ok=0 n_fail=0 act
+    local -a keep=()
+    acquire_lock
+    load_state
+    if ((${#ST_UUID[@]} == 0)); then
+        log "Nothing to restore: no saved state."
+        return 0
+    fi
+    scan_active
+
+    for i in "${!ST_UUID[@]}"; do
+        uuid="${ST_UUID[i]}"
+        if ! nmcli -g connection.uuid connection show uuid "$uuid" >/dev/null 2>&1; then
+            warn "connection $uuid no longer exists; dropping its saved values"
+            continue
+        fi
+        # Reapply only if the connection is active now.
+        dev=""
+        for act in "${!ACT_UUID[@]}"; do
+            [[ "${ACT_UUID[act]}" == "$uuid" ]] && dev="${ACT_DEV[act]}"
+        done
+        log "Restoring $uuid: never-default ${ST_V4ND[i]}/${ST_V6ND[i]}, route-metric ${ST_V4M[i]}/${ST_V6M[i]}"
+        if set_settings "$uuid" "${ST_V4ND[i]}" "${ST_V4M[i]}" "${ST_V6ND[i]}" "${ST_V6M[i]}" "$dev"; then
+            n_ok=$((n_ok + 1))
+        else
+            n_fail=$((n_fail + 1))
+            keep+=("$i")
+        fi
+    done
+
+    if ((n_fail)); then
+        err "could not restore $n_fail connection(s); their saved values stay in $STATE_FILE. Run by hand:"
+        for i in "${keep[@]}"; do
+            print_recovery "${ST_UUID[i]}" "${ST_V4ND[i]}" "${ST_V4M[i]}" "${ST_V6ND[i]}" "${ST_V6M[i]}"
+        done
+        if ((!DRY_RUN)); then
+            local -a ku=() k4nd=() k4m=() k6nd=() k6m=() kd=()
+            for i in "${keep[@]}"; do
+                ku+=("${ST_UUID[i]}") k4nd+=("${ST_V4ND[i]}") k4m+=("${ST_V4M[i]}")
+                k6nd+=("${ST_V6ND[i]}") k6m+=("${ST_V6M[i]}") kd+=("${ST_DEV[i]}")
+            done
+            ST_UUID=("${ku[@]}") ST_V4ND=("${k4nd[@]}") ST_V4M=("${k4m[@]}")
+            ST_V6ND=("${k6nd[@]}") ST_V6M=("${k6m[@]}") ST_DEV=("${kd[@]}")
+            save_state
+        fi
+        return "$EX_ROLLBACK"
+    fi
+
+    if ((!DRY_RUN)); then
+        ST_UUID=() ST_V4ND=() ST_V4M=() ST_V6ND=() ST_V6M=() ST_DEV=()
+        save_state
+        any_default_route || warn "no default route is present now; check your normal uplink"
+    fi
+    log "Restored $n_ok connection(s) and removed the saved state."
+}
+
+# --------------------------------------------------------- mode: status
+
+mode_status() {
+    local fam dev via metric i w rc=0 name
+    scan_active
+
+    log "== default routes =="
+    local any=0
+    while read -r fam dev via metric; do
+        any=1
+        log "IPv$fam default via $via dev $dev metric $metric"
+    done < <(default_routes)
+    ((any)) || log "(none)"
+
+    log ""
+    log "== carrying the default route =="
+    for fam in 4 6; do
+        w="$(winner_dev "$fam")"
+        if [[ -n "$w" ]]; then
+            log "IPv$fam: $(dev_to_name "$w") (device $w)"
+        else
+            log "IPv$fam: none"
+        fi
+    done
+
+    log ""
+    log "== connection settings =="
+    local shown=0
+    for i in "${!ACT_UUID[@]}"; do
+        [[ "${ACT_TYPE[i]}" == "other" ]] && continue
+        shown=1
+        name="${ACT_NAME[i]}"
+        if read_settings "${ACT_UUID[i]}"; then
+            log "$name [${ACT_TYPE[i]}] device ${ACT_DEV[i]:--}: ipv4 never-default=$V4ND route-metric=$V4M; ipv6 never-default=$V6ND route-metric=$V6M"
+        else
+            log "$name [${ACT_TYPE[i]}] device ${ACT_DEV[i]:--}: (settings unreadable)"
+        fi
+    done
+    ((shown)) || log "(no active ethernet, wifi or gsm connection)"
+    load_state
+    if ((${#ST_UUID[@]})); then
+        log "saved state: ${#ST_UUID[@]} connection(s) in $STATE_FILE (cell mode is on)"
+    else
+        log "saved state: none (cell mode is off)"
+    fi
+
+    log ""
+    log "== connectivity check (separate from the settings above) =="
+    if [[ -z "$CFG_CHECK_URL" ]]; then
+        log "disabled (CHECK_URL is empty)"
+    elif curl -fsS -o /dev/null --max-time "$CFG_CHECK_TIMEOUT" -- "$CFG_CHECK_URL" 2>/dev/null; then
+        log "ok: $CFG_CHECK_URL answered within ${CFG_CHECK_TIMEOUT}s"
+    else
+        log "FAILED: $CFG_CHECK_URL did not answer within ${CFG_CHECK_TIMEOUT}s"
+        rc="$EX_NOCONNECT"
+    fi
+    return "$rc"
+}
+
+# ------------------------------------------------------------------ main
+
+main() {
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+        --dry-run) DRY_RUN=1 ;;
+        -h | --help)
+            usage
+            exit "$EX_OK"
+            ;;
+        --version)
+            log "uplink-flip $VERSION"
+            exit "$EX_OK"
+            ;;
+        cell | normal | status)
+            [[ -z "$MODE" ]] || {
+                usage >&2
+                die "$EX_USAGE" "only one mode may be given"
+            }
+            MODE="$arg"
+            ;;
+        *)
+            usage >&2
+            die "$EX_USAGE" "unknown argument: $arg"
+            ;;
+        esac
+    done
+    if [[ -z "$MODE" ]]; then
+        usage >&2
+        die "$EX_USAGE" "a mode is required"
+    fi
+    command -v nmcli >/dev/null 2>&1 || die "$EX_REFUSED" "nmcli not found"
+    command -v ip >/dev/null 2>&1 || die "$EX_REFUSED" "ip not found"
+    load_config
+    trap on_exit EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+
+    ((DRY_RUN)) && log "(dry run: nothing will be changed)"
+    case "$MODE" in
+    cell) mode_cell ;;
+    normal) mode_normal ;;
+    status) mode_status ;;
+    esac
+}
+
+main "$@"

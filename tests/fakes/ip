@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Recording fake ip: only "route show default" for -4 and -6.
+set -u
+: "${FAKE_DIR:?}"
+{
+    printf 'ip'
+    for a in "$@"; do printf ' [%s]' "$a"; done
+    printf '\n'
+} >>"$FAKE_DIR/ip.log"
+case "$*" in
+"-4 route show default") cat "$FAKE_DIR/routes4" ;;
+"-6 route show default") cat "$FAKE_DIR/routes6" ;;
+*)
+    echo "fake ip: unexpected call: $*" >&2
+    exit 99
+    ;;
+esac
