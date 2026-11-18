@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Recording fake curl. FAKE_CURL_RC sets the exit code.
+set -u
+: "${FAKE_DIR:?}"
+{
+    printf 'curl'
+    for a in "$@"; do printf ' [%s]' "$a"; done
+    printf '\n'
+} >>"$FAKE_DIR/curl.log"
+exit "${FAKE_CURL_RC:-0}"

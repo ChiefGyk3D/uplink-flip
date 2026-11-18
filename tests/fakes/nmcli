@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# Recording fake nmcli. State lives in $FAKE_DIR (see tests/run.sh).
+set -u
+: "${FAKE_DIR:?}"
+{
+    printf 'nmcli'
+    for a in "$@"; do printf ' [%s]' "$a"; done
+    printf '\n'
+} >>"$FAKE_DIR/nmcli.log"
+all="$*"
+
+if [[ -n "${FAKE_FAIL_MATCH:-}" && ("$1" == "connection" && ("$2" == "modify" || "$2" == "up") || "$1" == "device" && "$2" == "reapply") && "$all" == *"$FAKE_FAIL_MATCH"* ]]; then
+    # FAKE_FAIL_ONCE=1 fails only the first matching call.
+    if [[ -z "${FAKE_FAIL_ONCE:-}" || ! -e "$FAKE_DIR/failed_once" ]]; then
+        : >"$FAKE_DIR/failed_once"
+        echo "Error: fake failure" >&2
+        exit 1
+    fi
+fi
+if [[ -n "${FAKE_SLEEP_MATCH:-}" && "$all" == *"$FAKE_SLEEP_MATCH"* ]]; then
+    : >"$FAKE_DIR/sleeping"
+    sleep 2
+fi
+
+case "$all" in
+    "-t --escape no -f UUID,TYPE,DEVICE,NAME connection show --active")
+        cat "$FAKE_DIR/active"
+        ;;
+    "-g ipv4.never-default,ipv4.route-metric,ipv6.never-default,ipv6.route-metric connection show uuid "*)
+        f="$FAKE_DIR/conn/${all##* }"
+        [[ -f "$f" ]] || {
+            echo "Error: no such connection" >&2
+            exit 10
+        }
+        cat "$f"
+        ;;
+    "-g GENERAL.IP-IFACE device show "*)
+        # Modems: the NM device (cdc-wdm0) differs from the IP interface.
+        f="$FAKE_DIR/ipiface/${all##* }"
+        if [[ -f "$f" ]]; then cat "$f"; else echo "${all##* }"; fi
+        ;;
+    "-g connection.uuid connection show uuid "*)
+        f="$FAKE_DIR/conn/${all##* }"
+        [[ -f "$f" ]] || exit 10
+        echo "${all##* }"
+        ;;
+    "connection modify uuid "*)
+        f="$FAKE_DIR/conn/$4"
+        [[ -f "$f" ]] || exit 10
+        shift 4
+        mapfile -t cur <"$f"
+        while (($#)); do
+            case "$1" in
+                ipv4.never-default) cur[0]="$2" ;;
+                ipv4.route-metric) cur[1]="$2" ;;
+                ipv6.never-default) cur[2]="$2" ;;
+                ipv6.route-metric) cur[3]="$2" ;;
+                *)
+                    echo "Error: bad property $1" >&2
+                    exit 2
+                    ;;
+            esac
+            shift 2
+        done
+        printf '%s\n' "${cur[@]}" >"$f"
+        ;;
+    "device reapply "* | "connection up uuid "*)
+        n=0
+        [[ -f "$FAKE_DIR/seq" ]] && n="$(cat "$FAKE_DIR/seq")"
+        n=$((n + 1))
+        echo "$n" >"$FAKE_DIR/seq"
+        for fam in 4 6; do
+            if [[ -f "$FAKE_DIR/routes$fam.$n" ]]; then
+                cp "$FAKE_DIR/routes$fam.$n" "$FAKE_DIR/routes$fam"
+            fi
+        done
+        ;;
+    *)
+        echo "fake nmcli: unexpected call: $all" >&2
+        exit 99
+        ;;
+esac
