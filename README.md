@@ -86,17 +86,30 @@ the nmcli manual describes as attempting to "update device with changes to the
 currently active connection made since it was last applied". It does not
 disconnect the device.
 
-**Unverified:** the documentation does not say that `device reapply` covers
-route changes (`never-default`, `route-metric`) on every NetworkManager
-version, and this tool has only been tested against a fake `nmcli`, never a
-live NetworkManager. So `cell` does not trust it: after applying, it reads the
-real default routes with `ip route show default`. If the gsm device does not
-win, it falls back to the documented reactivation (`nmcli connection up uuid
-...`, which briefly drops and re-establishes that one connection) for the
-connection still carrying the default route, then checks again. If the gsm
-device still does not win, or no default route is left, everything is rolled
-back. If you run it on a real machine, please check `uplink-flip status`
-afterwards and report what you see.
+**Tested once on a real machine.** On a laptop with wifi and a USB modem
+(NetworkManager 1.52.1, Debian-family Linux), `cell` demoted the wifi
+connection (`never-default yes`, `route-metric 2000`, IPv4 and IPv6) and
+`nmcli device reapply` on the wifi device was enough: the kernel's default
+routes became only the modem's (IPv4 and IPv6), a real HTTPS request worked
+over the modem, and `status` named the modem connection for both defaults.
+`normal` restored the exact previous values (a before and after capture of
+every connection's settings and every default route was identical), and a
+second `normal` changed nothing. Two wifi profiles with the same name were
+handled because connections are addressed by UUID.
+
+Because the documentation does not promise that `device reapply` covers route
+changes on every NetworkManager version, `cell` still does not trust it: after
+applying, it reads the real default routes with `ip route show default`. If the
+gsm device does not win, it falls back to the documented reactivation
+(`nmcli connection up uuid ...`, which briefly drops and re-establishes that
+one connection) for the connection still carrying the default route, then
+checks again. If the gsm device still does not win, or no default route is
+left, everything is rolled back.
+
+**Not tested** on real hardware: the `connection up` reactivation fallback
+(reapply worked, so it never ran), IPv6-only setups, setups with more than one
+modem, and distributions other than Debian-family. If you try one of these,
+please check `uplink-flip status` afterwards and report what you see.
 
 ## Safety notes
 
@@ -140,8 +153,8 @@ DEMOTE_METRIC=2000
 ```
 
 State is stored in `$XDG_STATE_HOME/uplink-flip/state`
-(`~/.local/state/uplink-flip/state`): directory mode 700, file mode 600,
-written atomically.
+(`~/.local/state/uplink-flip/state`): directory mode 700, state file and lock file mode 600,
+state written atomically.
 
 ## Troubleshooting
 

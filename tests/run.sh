@@ -165,6 +165,7 @@ t_state_file_modes() {
     run cell
     assert_eq "state dir mode" 700 "$(mode_of "$XDG_STATE_HOME/uplink-flip")"
     assert_eq "state file mode" 600 "$(mode_of "$STATE")"
+    assert_eq "lock file mode" 600 "$(mode_of "$XDG_STATE_HOME/uplink-flip/lock")"
     assert_eq "no temp files left" "lock
 state" "$(ls "$XDG_STATE_HOME/uplink-flip")"
 }

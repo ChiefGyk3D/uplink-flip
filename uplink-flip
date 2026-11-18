@@ -404,7 +404,12 @@ save_state() {
 acquire_lock() {
     ((DRY_RUN)) && return 0
     ensure_state_dir
+    local old_umask
+    old_umask="$(umask)"
+    umask 077
     exec 9>"$STATE_DIR/lock"
+    umask "$old_umask"
+    chmod 600 "$STATE_DIR/lock"
     flock -n 9 || die "$EX_REFUSED" "another uplink-flip is running"
 }
 
