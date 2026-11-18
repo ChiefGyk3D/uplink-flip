@@ -40,7 +40,7 @@ assert_file_missing() { if [[ ! -e "$2" ]]; then pass; else fail "$1: $2 exists"
 new_env() {
     T="$ROOT/$CUR"
     rm -rf "$T"
-    mkdir -p "$T/fake/conn" "$T/home" "$T/ran"
+    mkdir -p "$T/fake/conn" "$T/fake/ipiface" "$T/home" "$T/ran"
     export FAKE_DIR="$T/fake" HOME="$T/home"
     export XDG_STATE_HOME="$T/state" XDG_CONFIG_HOME="$T/config"
     export PATH="$HERE/fakes:$ORIG_PATH"
@@ -48,8 +48,10 @@ new_env() {
         UPLINK_FLIP_CHECK_URL UPLINK_FLIP_CHECK_TIMEOUT UPLINK_FLIP_DEMOTE_METRIC \
         FAKE_FAIL_MATCH FAKE_FAIL_ONCE FAKE_SLEEP_MATCH FAKE_CURL_RC
     STATE="$XDG_STATE_HOME/uplink-flip/state"
-    printf '%s:802-3-ethernet:eth0:%s\n%s:802-11-wireless:wlan0:Home Wifi\n%s:gsm:wwan0:my-cell\n' \
+    printf '%s:802-3-ethernet:eth0:%s\n%s:802-11-wireless:wlan0:Home Wifi\n%s:gsm:cdc-wdm0:my-cell\n' \
         "$E" "$E_NAME" "$W" "$G" >"$FAKE_DIR/active"
+    # Real modem shape: NM device cdc-wdm0, IP interface wwan0 (routes only there).
+    echo wwan0 >"$FAKE_DIR/ipiface/cdc-wdm0"
     # Originals: ethernet is stock; wifi carries a custom metric.
     printf 'no\n-1\nno\n-1\n' >"$FAKE_DIR/conn/$E"
     printf 'no\n700\nno\n700\n' >"$FAKE_DIR/conn/$W"
@@ -80,6 +82,7 @@ mode_of() { stat -c '%a' "$1"; }
 orig_routes() { cp "$FAKE_DIR/routes4" "$FAKE_DIR/routes4.$1"; }
 
 LIST='nmcli [-t] [--escape] [no] [-f] [UUID,TYPE,DEVICE,NAME] [connection] [show] [--active]'
+ipif() { printf 'nmcli [-g] [GENERAL.IP-IFACE] [device] [show] [%s]\n' "$1"; }
 rd() { printf 'nmcli [-g] [ipv4.never-default,ipv4.route-metric,ipv6.never-default,ipv6.route-metric] [connection] [show] [uuid] [%s]\n' "$1"; }
 mod() { # uuid v4nd v4m v6nd v6m
     printf 'nmcli [connection] [modify] [uuid] [%s] [ipv4.never-default] [%s] [ipv6.never-default] [%s] [ipv4.route-metric] [%s] [ipv6.route-metric] [%s]\n' "$1" "$2" "$4" "$3" "$5"
@@ -94,6 +97,9 @@ t_cell_exact_calls_and_state() {
     assert_eq "exit" 0 "$RC"
     expected="$(
         echo "$LIST"
+        ipif eth0
+        ipif wlan0
+        ipif cdc-wdm0
         rd "$E"
         rd "$W"
         rd "$E"
@@ -111,6 +117,47 @@ t_cell_exact_calls_and_state() {
 conn $E no -1 no -1 eth0
 conn $W no 700 no 700 wlan0"
     assert_eq "state content (originals)" "$expected_state" "$(cat "$STATE")"
+}
+
+t_cell_on_split_name_modem() {
+    # NM device cdc-wdm0, IP interface wwan0: reapply uses the NM device, the
+    # route checks use the IP interface, and the modem is never reapplied.
+    run cell
+    assert_eq "exit" 0 "$RC"
+    assert_not_contains "modem not reapplied" "$(modifying_calls)" "$(reapply cdc-wdm0)"
+    assert_not_contains "modem not reapplied by ip iface" "$(modifying_calls)" "$(reapply wwan0)"
+    assert_contains "ethernet reapplied by device" "$(modifying_calls)" "$(reapply eth0)"
+    run status
+    assert_contains "winner is the modem" "$OUT" "IPv4: my-cell (interface wwan0)"
+}
+
+t_fallback_reactivates_by_nm_device_on_split_modem() {
+    # The loser is matched on the IP interface; here ethernet (same name).
+    # A modem whose NM device differs must not be mistaken for the loser.
+    orig_routes 1
+    orig_routes 2
+    echo 'default via 198.51.100.1 dev wwan0 proto static metric 1100' >"$FAKE_DIR/routes4.3"
+    run cell
+    assert_eq "exit" 0 "$RC"
+    assert_not_contains "modem not reactivated" "$(modifying_calls)" "$(up "$G")"
+}
+
+t_reapply_uses_nm_device_when_ip_interface_differs() {
+    echo wlp9 >"$FAKE_DIR/ipiface/wlan0"
+    sed -i 's/dev wlan0/dev wlp9/' "$FAKE_DIR/routes4"
+    run cell
+    assert_eq "exit" 0 "$RC"
+    assert_contains "reapply by NM device" "$(modifying_calls)" "$(reapply wlan0)"
+    assert_not_contains "never by IP interface" "$(modifying_calls)" "$(reapply wlp9)"
+}
+
+t_status_names_modem_for_ipv4_and_ipv6() {
+    echo 'default via 198.51.100.1 dev wwan0 proto static metric 1100' >"$FAKE_DIR/routes4"
+    echo 'default via 2001:db8::1 dev wwan0 proto ra metric 1100' >"$FAKE_DIR/routes6"
+    run status
+    assert_contains "ipv4" "$OUT" "IPv4: my-cell (interface wwan0)"
+    assert_contains "ipv6" "$OUT" "IPv6: my-cell (interface wwan0)"
+    assert_not_contains "no unknown connection" "$OUT" "(unknown connection)"
 }
 
 t_state_file_modes() {
@@ -154,6 +201,9 @@ t_normal_restores_exactly() {
     assert_file_missing "state removed" "$STATE"
     expected="$(
         echo "$LIST"
+        ipif eth0
+        ipif wlan0
+        ipif cdc-wdm0
         mod "$E" no -1 no -1
         reapply eth0
         mod "$W" no 700 no 700
@@ -311,7 +361,7 @@ R
 t_names_with_spaces_and_metacharacters() {
     # shellcheck disable=SC2016 # literal text on purpose
     nasty='Wired $(touch PWNED); `id` "q" '"'"'s'"'"' * \ a:b'
-    printf '%s:802-3-ethernet:eth0:%s\n%s:gsm:wwan0:my cell $(x)\n' "$E" "$nasty" "$G" >"$FAKE_DIR/active"
+    printf '%s:802-3-ethernet:eth0:%s\n%s:gsm:cdc-wdm0:my cell $(x)\n' "$E" "$nasty" "$G" >"$FAKE_DIR/active"
     (cd "$T/ran" && "$SCRIPT" cell >"$T/out" 2>"$T/err")
     RC=$?
     assert_eq "exit" 0 "$RC"
@@ -320,7 +370,7 @@ t_names_with_spaces_and_metacharacters() {
     assert_contains "name shown verbatim" "$(cat "$T/out")" "Demoting '$nasty'"
     # Override by the same nasty name selects only that connection.
     run normal
-    printf '%s:802-3-ethernet:eth0:%s\n%s:802-3-ethernet:eth1:other\n%s:gsm:wwan0:my-cell\n' "$E" "$nasty" "$W" "$G" >"$FAKE_DIR/active"
+    printf '%s:802-3-ethernet:eth0:%s\n%s:802-3-ethernet:eth1:other\n%s:gsm:cdc-wdm0:my-cell\n' "$E" "$nasty" "$W" "$G" >"$FAKE_DIR/active"
     UPLINK_FLIP_ETHERNET="$nasty" run cell
     assert_eq "override exit" 0 "$RC"
     assert_contains "named one changed" "$(modifying_calls)" "[$E]"
@@ -330,7 +380,7 @@ t_names_with_spaces_and_metacharacters() {
 t_control_characters_in_name_are_skipped() {
     local esc
     printf -v esc '\033'
-    printf '%s:802-3-ethernet:eth0:Wired%s[31m\n%s:gsm:wwan0:my-cell\n' "$E" "$esc" "$G" >"$FAKE_DIR/active"
+    printf '%s:802-3-ethernet:eth0:Wired%s[31m\n%s:gsm:cdc-wdm0:my-cell\n' "$E" "$esc" "$G" >"$FAKE_DIR/active"
     run cell
     assert_eq "exit" 0 "$RC"
     assert_contains "warning" "$ERR" "skipping a connection"
@@ -362,9 +412,9 @@ t_status() {
     run status
     assert_eq "exit" 0 "$RC"
     assert_contains "routes" "$OUT" "IPv4 default via 192.0.2.1 dev eth0 metric 100"
-    assert_contains "winner" "$OUT" "IPv4: $E_NAME (device eth0)"
+    assert_contains "winner" "$OUT" "IPv4: $E_NAME (interface eth0)"
     assert_contains "settings" "$OUT" "Home Wifi [wifi] device wlan0: ipv4 never-default=no route-metric=700"
-    assert_contains "gsm settings" "$OUT" "my-cell [gsm] device wwan0"
+    assert_contains "gsm settings" "$OUT" "my-cell [gsm] device cdc-wdm0"
     assert_contains "cell off" "$OUT" "cell mode is off"
     assert_contains "check section" "$OUT" "== connectivity check (separate from the settings above) =="
     assert_contains "check ok" "$OUT" "ok: http://nmcheck.gnome.org/check_network_status.txt answered within 5s"
@@ -372,7 +422,7 @@ t_status() {
     assert_eq "status changes nothing" "" "$(modifying_calls)"
     run cell
     run status
-    assert_contains "winner after cell" "$OUT" "IPv4: my-cell (device wwan0)"
+    assert_contains "winner after cell" "$OUT" "IPv4: my-cell (interface wwan0)"
     assert_contains "cell on" "$OUT" "cell mode is on"
 }
 
@@ -383,7 +433,7 @@ t_status_connectivity_failure() {
     assert_contains "message" "$OUT" "FAILED"
     UPLINK_FLIP_CHECK_URL="" run status
     assert_eq "disabled check exit" 0 "$RC"
-    assert_contains "disabled" "$OUT" "disabled"
+    assert_contains "skipped with a clear message" "$OUT" "skipped: no check target set"
 }
 
 t_usage() {

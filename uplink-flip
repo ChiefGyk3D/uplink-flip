@@ -31,6 +31,7 @@ CFG_DEMOTE_METRIC="2000"
 ACT_UUID=()
 ACT_TYPE=()
 ACT_DEV=()
+ACT_IP=()
 ACT_NAME=()
 
 # Connections touched by an apply in progress (parallel arrays), for rollback.
@@ -102,7 +103,7 @@ die() {
 valid_uuid() { [[ "$1" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; }
 valid_bool() { [[ "$1" == "yes" || "$1" == "no" ]]; }
 valid_metric() { [[ "$1" =~ ^(-1|[0-9]{1,10})$ ]] && ((10#${1#-} <= 4294967295)); }
-valid_dev() { [[ "$1" =~ ^[A-Za-z0-9_.:@-]{1,32}$ ]]; }
+valid_dev() { [[ "$1" =~ ^[A-Za-z0-9_.:@][A-Za-z0-9_.:@-]{0,31}$ ]]; }
 # A name is acceptable when it is non-empty and holds no control character
 # (this also rules out terminal escape sequences in anything we print).
 valid_name() { [[ -n "$1" && ! "$1" =~ [[:cntrl:]] ]]; }
@@ -192,8 +193,8 @@ nm_change() {
 # name holding ':' stays intact; NAME is last so read keeps the rest of the
 # line. Every field is validated; a bad entry is skipped with a warning.
 scan_active() {
-    local out line uuid type dev name
-    ACT_UUID=() ACT_TYPE=() ACT_DEV=() ACT_NAME=()
+    local out line uuid type dev name ip_if
+    ACT_UUID=() ACT_TYPE=() ACT_DEV=() ACT_IP=() ACT_NAME=()
     out="$(nmcli -t --escape no -f UUID,TYPE,DEVICE,NAME connection show --active)" ||
         die "$EX_FAIL" "nmcli could not list active connections"
     while IFS= read -r line; do
@@ -216,7 +217,18 @@ scan_active() {
         esac
         ACT_UUID+=("$uuid")
         ACT_TYPE+=("$type")
+        # The NM device name (cdc-wdm0 for a modem) can differ from the IP
+        # interface that carries the traffic and shows up in "ip route". Routes
+        # are matched on the IP interface; "device reapply" takes the NM device.
+        ip_if="$dev"
+        if [[ -n "$dev" ]]; then
+            ip_if="$(nmcli -g GENERAL.IP-IFACE device show "$dev" 2>/dev/null)" || ip_if=""
+            if [[ -z "$ip_if" ]] || ! valid_dev "$ip_if"; then
+                ip_if="$dev"
+            fi
+        fi
         ACT_DEV+=("$dev")
+        ACT_IP+=("$ip_if")
         ACT_NAME+=("$name")
     done <<<"$out"
 }
@@ -307,7 +319,7 @@ dev_has_gateway_default() {
 dev_to_name() {
     local want="$1" i
     for i in "${!ACT_DEV[@]}"; do
-        if [[ "${ACT_DEV[i]}" == "$want" ]]; then
+        if [[ "${ACT_IP[i]}" == "$want" ]]; then
             printf '%s' "${ACT_NAME[i]}"
             return 0
         fi
@@ -526,11 +538,11 @@ mode_cell() {
     GSM_IDX=-1
     scan_active
     pick_gsm
-    gdev="${ACT_DEV[GSM_IDX]}"
+    gdev="${ACT_IP[GSM_IDX]}"
     gname="${ACT_NAME[GSM_IDX]}"
     [[ -n "$gdev" ]] || die "$EX_REFUSED" "gsm connection '$gname' has no device"
     dev_has_gateway_default "$gdev" ||
-        die "$EX_REFUSED" "gsm connection '$gname' (device $gdev) has no default route with its own gateway; nothing changed"
+        die "$EX_REFUSED" "gsm connection '$gname' (interface $gdev) has no default route with its own gateway; nothing changed"
 
     # Targets: active ethernet and wifi connections (or the overrides).
     for i in "${!ACT_UUID[@]}"; do
@@ -633,7 +645,7 @@ mode_cell() {
             # documented reactivation, for the connection on that device only.
             warn "default route still goes through $loser after reapply; reactivating that connection"
             for i in "${todo[@]}"; do
-                [[ "${ACT_DEV[i]}" == "$loser" ]] || continue
+                [[ "${ACT_IP[i]}" == "$loser" ]] || continue
                 nm_change connection up uuid "${ACT_UUID[i]}" ||
                     die "$EX_FAIL" "could not reactivate '${ACT_NAME[i]}'"
             done
@@ -724,7 +736,7 @@ mode_status() {
     for fam in 4 6; do
         w="$(winner_dev "$fam")"
         if [[ -n "$w" ]]; then
-            log "IPv$fam: $(dev_to_name "$w") (device $w)"
+            log "IPv$fam: $(dev_to_name "$w") (interface $w)"
         else
             log "IPv$fam: none"
         fi
@@ -754,7 +766,7 @@ mode_status() {
     log ""
     log "== connectivity check (separate from the settings above) =="
     if [[ -z "$CFG_CHECK_URL" ]]; then
-        log "disabled (CHECK_URL is empty)"
+        log "skipped: no check target set (UPLINK_FLIP_CHECK_URL / CHECK_URL is empty), so no request was made"
     elif curl -fsS -o /dev/null --max-time "$CFG_CHECK_TIMEOUT" -- "$CFG_CHECK_URL" 2>/dev/null; then
         log "ok: $CFG_CHECK_URL answered within ${CFG_CHECK_TIMEOUT}s"
     else

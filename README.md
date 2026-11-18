@@ -125,7 +125,7 @@ auto-detection by connection type (ethernet, wifi, gsm).
 | `UPLINK_FLIP_ETHERNET` | `ETHERNET` | Name or UUID of the one ethernet connection to demote (default: all active ethernet). |
 | `UPLINK_FLIP_WIFI` | `WIFI` | Same for wifi. |
 | `UPLINK_FLIP_GSM` | `GSM` | Which connection is the cellular one (needed if more than one gsm connection is active). |
-| `UPLINK_FLIP_CHECK_URL` | `CHECK_URL` | `status` connectivity target. Default is NetworkManager's own check URL. Empty disables the check. |
+| `UPLINK_FLIP_CHECK_URL` | `CHECK_URL` | `status` connectivity target. Default is NetworkManager's own check host (see below). Empty skips the check (no request is made). |
 | `UPLINK_FLIP_CHECK_TIMEOUT` | `CHECK_TIMEOUT` | Seconds for the whole request (default 5). |
 | `UPLINK_FLIP_DEMOTE_METRIC` | `DEMOTE_METRIC` | Metric given to demoted connections (default 2000; keep it above the modem's). |
 | `UPLINK_FLIP_CONFIG` | | Config file path. Default `$XDG_CONFIG_HOME/uplink-flip/config` (`~/.config/uplink-flip/config`). |
@@ -159,6 +159,29 @@ written atomically.
 - **State file "corrupt"**: it is refused rather than guessed at. Inspect it
   (`# uplink-flip state v1` then `conn UUID v4nd v4metric v6nd v6metric dev`
   lines), fix or remove it by hand.
+
+## Real hardware: modem device versus IP interface
+
+For a modem, NetworkManager's device name (for example `cdc-wdm0`, the control
+port) differs from the IP interface that carries the traffic (for example
+`wwp0s20f0u4i4`), and `ip route` only ever shows the IP interface. uplink-flip
+reads each connection's IP interface with `nmcli -g GENERAL.IP-IFACE device
+show DEVICE` (falling back to the device name when it is empty) and uses that
+for everything about routes: the gateway check, "which connection carries the
+default route" and "does the modem win". It still passes the NM device name to
+`nmcli device reapply`. For ethernet and wifi the two names are normally the
+same.
+
+## The connectivity check and your privacy
+
+`status` makes one HTTP request, to the URL in `CHECK_URL`. **By default that
+is NetworkManager's own connectivity-check host**
+(`http://nmcheck.gnome.org/check_network_status.txt`), so running `status`
+sends one request there from your machine. To use a target you trust more, set
+`UPLINK_FLIP_CHECK_URL` (or `CHECK_URL` in the config file) to another
+`http://` or `https://` URL. To make no request at all, set it to an empty
+value (`UPLINK_FLIP_CHECK_URL=` or `CHECK_URL=`); `status` then prints that the
+check was skipped.
 
 ## Not in scope
 

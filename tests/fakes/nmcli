@@ -34,6 +34,11 @@ case "$all" in
     }
     cat "$f"
     ;;
+"-g GENERAL.IP-IFACE device show "*)
+    # Modems: the NM device (cdc-wdm0) differs from the IP interface.
+    f="$FAKE_DIR/ipiface/${all##* }"
+    if [[ -f "$f" ]]; then cat "$f"; else echo "${all##* }"; fi
+    ;;
 "-g connection.uuid connection show uuid "*)
     f="$FAKE_DIR/conn/${all##* }"
     [[ -f "$f" ]] || exit 10
