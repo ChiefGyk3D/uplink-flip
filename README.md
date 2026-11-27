@@ -212,4 +212,4 @@ the reusable workflows in `ChiefGyk3D/git-your-ship-together`.
 
 ## License
 
-GPL-3.0, see `LICENSE`.
+Apache-2.0, see `LICENSE`.
